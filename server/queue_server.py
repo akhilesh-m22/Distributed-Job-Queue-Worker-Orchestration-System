@@ -97,6 +97,8 @@ class QueueServer:
         self._lock = threading.RLock()
         self._workers = {}       # worker_id -> WorkerState
         self._socks = {}         # worker_id -> socket (for future broadcast)
+        self._connections = set()
+        self._client_threads = set()
         self._running = False
         self._listener = None
         self._accept_thread = None
@@ -139,15 +141,21 @@ class QueueServer:
     def stop(self):
         self._running = False
         with self._lock:
-            socks = list(self._socks.values())
-            self._socks.clear()
-            self._workers.clear()
+            socks = list(self._connections)
         for s in socks:
+            try:
+                s.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
             try:
                 s.close()
             except OSError:
                 pass
         if self._listener:
+            try:
+                self._listener.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
             try:
                 self._listener.close()
             except OSError:
@@ -155,6 +163,10 @@ class QueueServer:
         for t in (self._accept_thread, self._monitor_thread):
             if t and t.is_alive():
                 t.join(timeout=2.0)
+        with self._lock:
+            clients = list(self._client_threads)
+        for thread in clients:
+            thread.join(timeout=2.0)
         log.info("queue server stopped")
 
     # ------------------------------------------------------------------ #
@@ -170,6 +182,13 @@ class QueueServer:
                 target=self._handle_client, args=(conn, addr),
                 name="client-%s:%s" % addr[:2], daemon=True,
             )
+            conn.settimeout(max(10.0, self.heartbeat_timeout * 2))
+            with self._lock:
+                if not self._running:
+                    conn.close()
+                    break
+                self._connections.add(conn)
+                self._client_threads.add(t)
             t.start()
 
     def _handle_client(self, conn, addr):
@@ -182,6 +201,24 @@ class QueueServer:
                 except (ConnectionResetError, protocol.ProtocolError, OSError):
                     break
                 try:
+                    if msg["type"] == "register":
+                        caps = msg.get("capabilities")
+                        if worker_id or not isinstance(caps, list) or len(caps) > 100 or any(
+                            not isinstance(c, str) or not c or len(c) > 100 for c in caps
+                        ) or not isinstance(msg.get("name"), str):
+                            protocol.send(conn, protocol.server_error("invalid or duplicate registration"))
+                            break
+                    else:
+                        # Identity belongs to the socket, never to a client-supplied id.
+                        if not worker_id or msg.get("worker_id") != worker_id:
+                            protocol.send(conn, protocol.server_error("worker identity mismatch"))
+                            break
+                        if msg["type"] in {"ack", "fail"} and not isinstance(msg.get("job_id"), str):
+                            protocol.send(conn, protocol.server_error("job_id must be a string"))
+                            break
+                        if msg["type"] == "fail" and not isinstance(msg.get("error"), str):
+                            protocol.send(conn, protocol.server_error("error must be a string"))
+                            break
                     wid = self._dispatch(conn, msg, addr)
                     if wid:
                         worker_id = wid
@@ -202,6 +239,11 @@ class QueueServer:
                 conn.close()
             except OSError:
                 pass
+            with self._lock:
+                self._connections.discard(conn)
+                self._client_threads.discard(threading.current_thread())
+                if worker_id:
+                    self._socks.pop(worker_id, None)
 
     def _dispatch(self, conn, msg, addr):
         """Route a single message. Returns the worker_id referenced by the
@@ -249,30 +291,28 @@ class QueueServer:
             state = self._workers.get(worker_id)
             if state is None:
                 return
-            state.last_heartbeat = time.time()
-            if state.status == "dead":
-                # A worker we gave up on came back (transient network blip).
-                # It may still be running the job we already requeued, so we
-                # deliberately do NOT re-attach that job; when it acks, the
-                # store rejects the stale ack because job.worker_id changed.
-                log.info("worker %s revived after being marked dead",
-                         worker_id[:8])
-                state.status = "connected"
+            if state.status == "connected":
+                state.last_heartbeat = time.time()
 
     def _handle_fetch(self, conn, worker_id):
         with self._lock:
             state = self._workers.get(worker_id)
-        if state is None:
-            protocol.send(conn, protocol.server_error("unknown worker"))
+            if state is None or state.status != "connected":
+                job = None
+                error = "worker session expired; reconnect"
+            elif state.current_job:
+                job = None
+                error = "worker already has an in-flight job"
+            else:
+                error = None
+                job = self.store.claim_next(state.capabilities, worker_id)
+                if job:
+                    state.current_job = job["id"]
+                    state.current_job_type = job["task_type"]
+                    state.job_started_at = time.time()
+        if error or job is None:
+            protocol.send(conn, protocol.server_error(error) if error else protocol.no_job())
             return
-        job = self.store.claim_next(state.capabilities, worker_id)
-        if job is None:
-            protocol.send(conn, protocol.no_job())
-            return
-        with self._lock:
-            state.current_job = job["id"]
-            state.current_job_type = job["task_type"]
-            state.job_started_at = time.time()
         log.debug("granted job %s (%s) to worker %s attempt=%s",
                   job["id"][:8], job["task_type"], worker_id[:8], job["attempts"])
         protocol.send(conn, protocol.grant_job(
@@ -355,14 +395,21 @@ class QueueServer:
             job_id, state.current_job = state.current_job, None
             state.current_job_type = None
             state.job_started_at = None
+            # Keep claim and recovery under the same lock; a new owner cannot
+            # race with requeueing the previous owner's job.
+            if job_id:
+                self.store.requeue_job(job_id, reason="worker %s %s" % (worker_id[:8], reason))
+            sock = self._socks.get(worker_id)
+            if sock:
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
 
         if job_id:
-            applied = self.store.requeue_job(
-                job_id, reason="worker %s %s" % (worker_id[:8], reason)
-            )
             log.warning(
-                "requeued job %s from worker %s (%s) applied=%s",
-                job_id[:8], worker_id[:8], reason, applied,
+                "requeued job %s from worker %s (%s)",
+                job_id[:8], worker_id[:8], reason,
             )
         else:
             log.info("worker %s marked dead (%s); no in-flight job",
@@ -414,6 +461,10 @@ class QueueServer:
     def worker_snapshots(self):
         with self._lock:
             return [w.snapshot() for w in self._workers.values()]
+
+    @property
+    def is_running(self):
+        return self._running and self._monitor_thread.is_alive()
 
     @property
     def connected_workers(self):

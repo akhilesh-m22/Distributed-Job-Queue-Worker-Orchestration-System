@@ -73,6 +73,7 @@ class Cluster:
         env = dict(os.environ)
         # Spawned children quiet down to WARNING so the report stays readable.
         env["DJQ_LOG_LEVEL"] = "WARNING"
+        env["DJQ_OUTPUT_DIR"] = os.path.join(self._workdir, "output")
         server = subprocess.Popen(
             [sys.executable, "-m", "server",
              "--port", str(self.server_port),
@@ -126,13 +127,13 @@ def wait_for(predicate, timeout, interval=0.25, desc="condition"):
 def submit_job(base, task_type, payload, priority=0):
     r = requests.post(base + "/jobs", json={
         "task_type": task_type, "payload": payload, "priority": priority,
-    }, timeout=10)
+    }, headers=auth_headers(), timeout=10)
     r.raise_for_status()
     return r.json()["job_id"]
 
 
 def run(args):
-    base = "http://127.0.0.1:%d" % args.api_port
+    base = "http://%s:%d" % (args.attach or "127.0.0.1", args.api_port)
     cluster = None
 
     if not args.attach:
@@ -175,12 +176,16 @@ def run(args):
 
         # --- Phase B: kill the busiest worker mid-processing.
         victim = next(w for w in workers(base) if w["current_job"])
-        print("[4/6] KILLING worker %s (pid=%s) mid-job %s"
+        print("[4/6] selected worker %s (pid=%s) processing job %s"
               % (victim["name"], victim["pid"], victim["current_job"]))
         killed_job = victim["current_job"]
         t_kill = time.monotonic()
         try:
-            os.kill(victim["pid"], signal.SIGTERM)  # hard kill; no ACK possible
+            if cluster:
+                victim_process = next(p for p in cluster.procs if p.pid == victim["pid"])
+                victim_process.kill()  # hard kill; no ACK possible
+            else:
+                print("       ^ attach mode: skipping process kill (external process ownership)")
         except ProcessLookupError:
             print("       ^ worker pid already gone (race); continuing")
 
@@ -219,7 +224,7 @@ def run(args):
         )
         t_done = time.monotonic()
         results = fetch_all(base, set(all_ids))
-        verify_zero_loss(all_ids, killed_job, results)
+        verify_zero_loss(all_ids, killed_job if cluster else None, results)
 
         report(args, base, all_ids, results, victim)
         return 0 if ok and len(results) == len(all_ids) else 1
@@ -239,9 +244,14 @@ def healthy(base):
         return False
 
 
+def auth_headers():
+    token = os.getenv("DJQ_API_KEY")
+    return {"Authorization": "Bearer " + token} if token else {}
+
+
 def workers(base):
     try:
-        return requests.get(base + "/workers", timeout=5).json().get("workers", [])
+        return requests.get(base + "/workers", headers=auth_headers(), timeout=5).json().get("workers", [])
     except requests.RequestException:
         return []
 
@@ -252,16 +262,24 @@ def connected_workers(base):
 
 def drained(base, ids):
     results = fetch_all(base, ids)
-    return results and all(
+    return len(results) == len(ids) and all(
         r["status"] in ("succeeded", "dead-letter") for r in results.values()
     )
 
 
 def fetch_all(base, ids, chunk=200):
     """Fetch job details for a large id set efficiently via ?status-less list."""
-    r = requests.get(base + "/jobs", params={"limit": 10000}, timeout=10)
-    r.raise_for_status()
-    by_id = {j["job_id"]: j for j in r.json()["jobs"]}
+    by_id = {}
+    offset = 0
+    while True:
+        r = requests.get(base + "/jobs", params={"limit": chunk, "offset": offset},
+                         headers=auth_headers(), timeout=10)
+        r.raise_for_status()
+        page = r.json()
+        by_id.update({j["job_id"]: j for j in page["jobs"]})
+        if not page.get("has_more") or ids <= by_id.keys():
+            break
+        offset += chunk
     return {i: by_id[i] for i in ids if i in by_id}
 
 
@@ -269,13 +287,14 @@ def verify_zero_loss(all_ids, killed_job, results):
     missing = [i for i in all_ids if i not in results]
     dead = [j for j in results.values() if j["status"] == "dead-letter"]
     not_done = [j["job_id"] for j in results.values()
-                if j["status"] != "succeeded"]
+                if j["status"] not in ("succeeded", "dead-letter")]
     assert not missing, "LOST jobs (never recorded): %s" % missing
     assert not dead, "jobs reached dead-letter unexpectedly: %s" % dead
     assert not not_done, "jobs not completed: %s" % not_done
     # Exactly-once *completion*: every submitted job reached succeeded.
-    print("       ^ ZERO LOSS: all %d jobs succeeded exactly once" % len(all_ids))
+    print("       ^ ZERO LOSS: all %d jobs reached succeeded" % len(all_ids))
     if killed_job in results:
+        assert results[killed_job]["attempts"] >= 2, "victim job was not reclaimed"
         print("       ^ victim's job %s was recovered and completed by %s"
               % (killed_job[:8], results[killed_job]["worker_id"]))
 
@@ -296,8 +315,11 @@ def report(args, base, all_ids, results, victim):
     print("cluster:           %d workers, %d submitted jobs"
           % (args.workers, n))
     print("burst concurrency: %d parallel submitters" % min(n, 50))
-    print("kill:              worker %s (pid %s) killed mid-job %s"
-          % (victim["name"], victim["pid"], (victim["current_job"] or "?")[:8]))
+    if args.attach:
+        print("kill:              skipped (attached cluster; no owned processes)")
+    else:
+        print("kill:              worker %s (pid %s) killed mid-job %s"
+              % (victim["name"], victim["pid"], (victim["current_job"] or "?")[:8]))
     print("-------------------------------------------------------------------")
     print("final status:      succeeded=%d dead-letter=%d queued=%d running=%d"
           % (succeeded, dead_letter, queued, running))
@@ -309,7 +331,7 @@ def report(args, base, all_ids, results, victim):
     print("jobs that retried: %d (attempts > 1)" % retried)
     print("throughput:        %.1f jobs/sec (submission -> full drain)"
           % (n / max(drain_secs, 1e-6)))
-    print("recovery time:     %.1fs (victim job requeued + completed)"
+    print("victim latency:    %.1fs (job submission -> completion, includes recovery)"
           % recovery_secs)
     print("===================================================================\n")
 

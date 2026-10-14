@@ -10,12 +10,13 @@ execution is at-least-once).
 import json
 import os
 import random
+import re
+import tempfile
 import time
 
 from worker.tasks.registry import register, injectable_failure
 
-REPORT_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "var",
-                          "reports")
+REPORT_DIR = os.path.join(os.getenv("DJQ_OUTPUT_DIR", "var"), "reports")
 
 
 @register("generate_report")
@@ -23,7 +24,11 @@ def generate_report(payload, ctx):
     """Build a small summary report over ``payload.rows`` fake sales records."""
     injectable_failure(payload, ctx)
     report_id = payload.get("report_id") or "job-%s" % ctx["job_id"]
+    if not isinstance(report_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", report_id):
+        raise ValueError("report_id must contain 1–100 letters, numbers, underscores or hyphens")
     rows = int(payload.get("rows", 50))
+    if not 0 <= rows <= 100_000:
+        raise ValueError("rows must be between 0 and 100000")
     seed = payload.get("seed", ctx["job_id"])
     rng = random.Random(seed)
 
@@ -47,7 +52,15 @@ def generate_report(payload, ctx):
 
     os.makedirs(REPORT_DIR, exist_ok=True)
     path = os.path.join(REPORT_DIR, "%s.json" % report_id)
-    with open(path, "w", encoding="utf-8") as fh:
-        json.dump(report, fh, indent=2)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=REPORT_DIR,
+                                         suffix=".tmp", delete=False) as fh:
+            temporary = fh.name
+            json.dump(report, fh, indent=2)
+        os.replace(temporary, path)
+    finally:
+        if temporary and os.path.exists(temporary):
+            os.unlink(temporary)
 
     return {**report, "path": path}

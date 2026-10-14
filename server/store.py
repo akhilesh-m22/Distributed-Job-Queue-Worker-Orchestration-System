@@ -85,7 +85,7 @@ class Store:
             db_path, isolation_level=None, check_same_thread=False
         )
         self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA synchronous=NORMAL")
+        self._conn.execute("PRAGMA synchronous=FULL")
         self._create_schema()
 
     # ------------------------------------------------------------------ #
@@ -139,14 +139,14 @@ class Store:
             row = self._conn.execute(sql, params).fetchone()
         return self._row_to_job(row) if row else None
 
-    def _fetchall_where(self, where, params, limit):
+    def _fetchall_where(self, where, params, limit, offset=0):
         sql = "SELECT " + ", ".join(self._COLS) + " FROM jobs"
         if where:
             sql += " WHERE " + where
-        sql += " ORDER BY created_at DESC"
+        sql += " ORDER BY created_at DESC, id DESC"
         if limit:
-            sql += " LIMIT ?"
-            params = params + (limit,)
+            sql += " LIMIT ? OFFSET ?"
+            params = params + (limit, offset)
         with self._lock:
             rows = self._conn.execute(sql, params).fetchall()
         return [self._row_to_job(r) for r in rows]
@@ -158,7 +158,9 @@ class Store:
         """Enqueue a new job. Returns the created job dict."""
         now = utcnow()
         job_id = uuid.uuid4().hex
-        max_attempts = max_attempts or self.max_attempts
+        max_attempts = self.max_attempts if max_attempts is None else max_attempts
+        if type(max_attempts) is not int or not 1 <= max_attempts <= 100:
+            raise ValueError("max_attempts must be an integer between 1 and 100")
         with self._lock:
             self._conn.execute(
                 "INSERT INTO jobs (id, task_type, payload, status, priority, "
@@ -186,6 +188,8 @@ class Store:
         "Runnable" = status is ``queued`` AND backoff window has elapsed.
         Jobs are ordered by priority (higher = sooner) then FIFO by age.
         """
+        if not worker_capabilities:
+            return None
         now = now or utcnow()
 
         # Build the eligibility clause. A job is claimable if it is due
@@ -270,14 +274,14 @@ class Store:
         now = now or utcnow()
         with self._lock:
             row = self._conn.execute(
-                "SELECT status, worker_id, attempts FROM jobs WHERE id = ?",
+                "SELECT status, worker_id, attempts, max_attempts FROM jobs WHERE id = ?",
                 (job_id,),
             ).fetchone()
             if not (row and row[0] == STATUS_RUNNING and row[1] == worker_id):
                 return {"retry": False, "attempt": None, "retry_at": None,
                         "dead_letter": False}
             attempts = row[2]
-            if attempts >= self.max_attempts:
+            if attempts >= row[3]:
                 self._conn.execute(
                     "UPDATE jobs SET status = ?, last_error = ?, "
                     "finished_at = ?, updated_at = ? WHERE id = ?",
@@ -302,8 +306,9 @@ class Store:
 
     @staticmethod
     def _add_seconds(ts, seconds):
+        from datetime import timedelta
         dt = datetime.strptime(ts, "%Y-%m-%d %H:%M:%S.%f")
-        return datetime.fromtimestamp(dt.timestamp() + seconds).strftime(
+        return (dt + timedelta(seconds=seconds)).strftime(
             "%Y-%m-%d %H:%M:%S.%f"
         )
 
@@ -376,7 +381,7 @@ class Store:
     # ------------------------------------------------------------------ #
     # Queries for the API
     # ------------------------------------------------------------------ #
-    def list_jobs(self, status=None, task_type=None, limit=100):
+    def list_jobs(self, status=None, task_type=None, limit=100, offset=0, search=None):
         clauses = []
         params = []
         if status:
@@ -385,8 +390,16 @@ class Store:
         if task_type:
             clauses.append("task_type = ?")
             params.append(task_type)
+        if search:
+            clauses.append("(instr(id, ?) > 0 OR instr(task_type, ?) > 0)")
+            params.extend([search, search])
         where = " AND ".join(clauses)
-        return self._fetchall_where(where, tuple(params), limit)
+        return self._fetchall_where(where, tuple(params), limit, offset)
+
+    def ping(self):
+        """Verify the database connection for readiness probes."""
+        with self._lock:
+            return self._conn.execute("SELECT 1").fetchone()[0] == 1
 
     def list_dead_letter(self, limit=100):
         return self.list_jobs(status=STATUS_DEAD_LETTER, limit=limit)

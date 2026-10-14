@@ -60,15 +60,14 @@ class Worker:
     # ------------------------------------------------------------------ #
     # Heartbeats
     # ------------------------------------------------------------------ #
-    def _heartbeat_loop(self):
+    def _heartbeat_loop(self, sock, worker_id, session_stop):
         """Daemon thread: keep the broker convinced we are alive."""
-        while not self._stop.is_set() and self._sock:
+        while not self._stop.is_set() and not session_stop.is_set():
             try:
-                if self._worker_id:
-                    self._send(protocol.heartbeat(self._worker_id))
+                protocol.send(sock, protocol.heartbeat(worker_id), self._send_lock)
             except (OSError, ValueError):
                 return  # socket gone; session loop will reconnect
-            self._stop.wait(self.heartbeat_interval)
+            session_stop.wait(self.heartbeat_interval)
 
     # ------------------------------------------------------------------ #
     # The run loop
@@ -90,29 +89,34 @@ class Worker:
     def _run_session(self):
         """One connect -> register -> fetch/execute/ack cycle. Blocks."""
         sock = socket.create_connection((self.host, self.port), timeout=10)
-        sock.settimeout(None)
+        sock.settimeout(15)
         self._sock = sock
         # Register: get a brand new identity for this session (see module doc).
-        self._send(protocol.register(self.name, os.getpid(), self.capabilities))
-        msg = protocol.recv_message(sock)
-        self._worker_id = msg["worker_id"]
-        log.info("registered as %s (capabilities=%s)",
-                 self._worker_id[:8], self.capabilities)
-
-        heartbeat_thread = threading.Thread(
-            target=self._heartbeat_loop, name="heartbeat", daemon=True
-        )
-        heartbeat_thread.start()
-
+        session_stop = threading.Event()
+        heartbeat_thread = None
         try:
+            self._send(protocol.register(self.name, os.getpid(), self.capabilities))
+            msg = protocol.recv_message(sock)
+            if msg.get("type") != "registered" or not isinstance(msg.get("worker_id"), str):
+                raise protocol.ProtocolError("registration rejected")
+            self._worker_id = msg["worker_id"]
+            log.info("registered as %s (capabilities=%s)", self._worker_id[:8], self.capabilities)
+            heartbeat_thread = threading.Thread(
+                target=self._heartbeat_loop, args=(sock, self._worker_id, session_stop),
+                name="heartbeat", daemon=True,
+            )
+            heartbeat_thread.start()
             self._session_loop()
         finally:
+            session_stop.set()
+            if heartbeat_thread:
+                heartbeat_thread.join(timeout=2)
             # Try to release our in-flight job gracefully so the server does
             # not have to wait for a heartbeat timeout.
             try:
                 if self._worker_id:
                     self._send(protocol.unregister(self._worker_id))
-            except OSError:
+            except (OSError, AttributeError):
                 pass
             self._sock = None
             self._worker_id = None
@@ -142,7 +146,7 @@ class Worker:
                 # Nothing runnable for us right now (queue empty, or our
                 # backoff window hasn't elapsed). Short sleep avoids a hot
                 # polling loop; one sleeper per worker is cheap.
-                time.sleep(0.15)
+                self._stop.wait(0.15)
             elif mtype == "error":
                 raise ConnectionError("server error: %s" % msg.get("message"))
             else:
@@ -173,13 +177,20 @@ class Worker:
             self._send(protocol.fail(self._worker_id, job_id, result))
         # Consume the broker's confirmation before the next fetch.
         reply = protocol.recv_message(self._sock)
+        if reply.get("type") not in {"ack_ok", "fail_ok"}:
+            raise protocol.ProtocolError("broker rejected job result")
         log.debug("report for %s -> %s", job_id[:8], reply.get("type"))
 
     def stop(self):
         self._stop.set()
-        if self._sock:
+        sock = self._sock
+        if sock:
             try:
-                self._sock.close()  # interrupts the blocking recv()
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                sock.close()  # interrupts the blocking recv()
             except OSError:
                 pass
 

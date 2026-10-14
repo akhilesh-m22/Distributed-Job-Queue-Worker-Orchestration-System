@@ -1,0 +1,54 @@
+services:
+  broker:
+    build: .
+    init: true
+    restart: unless-stopped
+    environment:
+      DJQ_API_KEY: ${DJQ_API_KEY:-}
+    volumes:
+      - queue-data:/app/var
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5010/ready', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    stop_grace_period: 20s
+    networks: [queue]
+
+  worker:
+    build: .
+    init: true
+    command: ["python", "-m", "worker", "--host", "broker"]
+    restart: unless-stopped
+    depends_on:
+      broker:
+        condition: service_healthy
+    volumes:
+      - worker-output:/app/var/output
+    stop_grace_period: 20s
+    networks: [queue]
+
+  dashboard:
+    build: ./frontend
+    init: true
+    restart: unless-stopped
+    environment:
+      DJQ_API_URL: http://broker:5010
+    ports:
+      - "127.0.0.1:${DASHBOARD_PORT:-3000}:3000"
+    depends_on:
+      broker:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/api/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+    networks: [queue]
+
+volumes:
+  queue-data:
+  worker-output:
+networks:
+  queue:

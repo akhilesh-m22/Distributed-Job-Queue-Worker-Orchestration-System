@@ -49,13 +49,7 @@ def main(argv=None):
     )
     server = QueueServer(store, host=args.host, port=args.port,
                          heartbeat_timeout=args.heartbeat_timeout)
-    server.start(background=False)
-
     api_thread = None
-    if not args.no_api:
-        from api.server import run_api
-        _app, api_thread = run_api(server, host=args.host, port=args.api_port)
-        print("API listening on http://%s:%s" % (args.host, args.api_port))
 
     def shutdown(_sig, _frame):
         logging.getLogger().info("shutting down...")
@@ -65,11 +59,19 @@ def main(argv=None):
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
     try:
+        server.start(background=False)
+        if not args.no_api:
+            from api.server import run_api
+            _app, api_thread = run_api(server, host=args.host, port=args.api_port)
+            print("API listening on http://%s:%s" % (args.host, args.api_port), flush=True)
         # serve_forever() blocks in the accept loop on the main thread.
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
+        if api_thread:
+            api_thread.http_server.close()
+            api_thread.http_server.task_dispatcher.shutdown()
         server.stop()
         store.close()
 

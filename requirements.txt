@@ -1,4 +1,2 @@
-flask>=3.0
-waitress>=3.0
-requests>=2.31
-pytest>=8.0
+flask>=3.0,<4
+waitress>=3.0,<4

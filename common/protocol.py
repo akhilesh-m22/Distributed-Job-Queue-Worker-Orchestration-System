@@ -62,7 +62,10 @@ def recv_message(sock):
         raise ProtocolError("frame too large: %d bytes" % length)
     body = _read_exact(sock, length)
     try:
-        return json.loads(body.decode("utf-8"))
+        message = json.loads(body.decode("utf-8"))
+        if not isinstance(message, dict) or not isinstance(message.get("type"), str):
+            raise ProtocolError("frame must be an object with a string type")
+        return message
     except (ValueError, UnicodeDecodeError) as exc:
         raise ProtocolError("malformed JSON frame: %s" % exc)
 

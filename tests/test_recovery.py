@@ -21,7 +21,6 @@ SLOW = {"delay_secs": 60, "width": 1, "height": 1}
 def test_eof_recovery_requeues_job(api, store, server, worker_factory,
                                    submit, job_done):
     """A worker that vanishes without acking must not lose its job."""
-    worker_factory(capabilities=["send_email"])  # a healthy second worker
 
     job_id = submit("send_email", {"to": "lost@example.com", "delay_secs": 0.2})
 
@@ -34,6 +33,7 @@ def test_eof_recovery_requeues_job(api, store, server, worker_factory,
     # Job is immediately requeued by the EOF handler, then the real worker
     # claims and completes it.
     assert wait_for(lambda: store.get_job(job_id)["status"] == STATUS_QUEUED)
+    worker_factory(capabilities=["send_email"])
     assert job_done(job_id, "succeeded")
     body = api.get("/jobs/%s" % job_id).get_json()
     # Two executions happened (claim by crashy + claim by the survivor).
@@ -45,7 +45,6 @@ def test_heartbeat_timeout_requeues_job(api, store, server, worker_factory,
                                         submit, job_done):
     """A worker that goes silent (socket still open) is detected by the
     monitor from missing heartbeats and its job is requeued."""
-    worker_factory(capabilities=["send_email"])
     job_id = submit("send_email", {"to": "stuck@example.com", "delay_secs": 0.3})
 
     raw = RawWorker(server.host, server.port, name="zombie",
@@ -61,6 +60,7 @@ def test_heartbeat_timeout_requeues_job(api, store, server, worker_factory,
     )
     # And the job must have come back to the queue for the survivor.
     assert wait_for(lambda: store.get_job(job_id)["status"] == STATUS_QUEUED)
+    worker_factory(capabilities=["send_email"])
     assert job_done(job_id, "succeeded")
     raw.close()
 

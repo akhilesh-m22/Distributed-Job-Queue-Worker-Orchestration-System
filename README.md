@@ -1,247 +1,157 @@
-# Distributed Job Queue & Worker Orchestration System
+# Relay — Distributed Job Queue & Worker Orchestration
 
-A lightweight, language-agnostic distributed job queue with durable scheduling,
-at-least-once delivery, retries with exponential backoff, a dead-letter queue,
-heartbeat-based worker recovery, and a REST control plane. Built as if it were a
-minimal Celery/Sidekiq from first principles — no pub/sub broker, no external
-queuing dependency; the broker, the worker protocol, and the persistence layer
-are all implemented here.
+A durable queue built from first principles, with a live control room that makes its failure modes visible. Python owns the TCP broker and SQLite state machine; independent workers execute jobs; a Next.js dashboard lets you submit, inspect, and recover work.
 
-```
-                     ┌──────────────────────────────────────────────┐
-                     │                QUEUE SERVER                  │
-   submit jobs ────►  │                                              │
-  (REST :5010)       │  ┌─────────────┐   ┌──────────┐   ┌────────┐  │
-                     │  │ REST API    │   │ TCP broker│──►│ SQLite │  │
-                     │  │ (waitress)  │   │ (port    │   │ store  │  │
-                     │  │             │   │  5555)   │   │ (WAL)  │  │
-                     │  └─────────────┘   │          │   └────────┘  │
-                     │                    │  ◄──register/fetch────── │
-                     │                    └──┼──heartbeat/ack/fail──►│
-                     └──────────────────────┼───────────────────────┘
-                                            │
-                              ┌─────────────┼──────────────┐
-                              ▼             ▼              ▼
-                         ┌─────────┐   ┌─────────┐   ┌─────────┐
-                         │ worker 0│   │ worker 1│   │ worker 2│
-                         └─────────┘   └─────────┘   └─────────┘
-                             one synchronous job at a time each
-```
+**Designed for a local portfolio/interview demo, packaged for a single-host deployment.** No Redis, RabbitMQ, or external database required.
 
-## What it does
+![Relay dashboard](docs/dashboard.jpg)
 
-- **Broker + workers over raw TCP** with a tiny length-prefixed JSON protocol.
-- **Durable scheduling**: jobs live in SQLite (WAL mode), claimed jobs are
-  marked `running`, not deleted.
-- **At-least-once delivery**: a job is only considered done when the worker
-  sends `ack`. Any failure to ack (crash, killed process, dropped socket,
-  missed heartbeat) causes the job to be requeued and run again elsewhere.
-- **Retries with exponential backoff + jitter**, then a **dead-letter queue**
-  after `max_attempts`; dead-lettered jobs can be inspected and manually retried
-  through the API.
-- **Heartbeat monitoring**: the server requeues jobs whose worker goes silent
-  (killed, hung, or network partition). Three independent recovery paths cover
-  every failure mode (see [Failure recovery](#failure-recovery)).
-- **REST API** for submitting jobs, inspecting the queue, live workers, dead
-  letters, and stats.
-- **Task registry with capability matching**: workers advertise what task types
-  they can run; a job is only dispatched to a worker that advertises the type.
-- **Priorities**: integer priority, lower value runs first.
+## Start the demo
 
-## Quickstart
+Prerequisites: Python 3.11+ and Node.js 24. From the repository root:
 
 ```bash
-pip install -r requirements.txt
-
-# 1. Start one queue server (TCP broker + REST API on :5010)
-python -m server --port 5555 --api-port 5010 --db var/queue.db
-
-# 2. Start as many workers as you like
-python -m worker --name w1 --port 5555
-python -m worker --name w2 --port 5555
-
-# 3. Submit a job
-curl -X POST http://127.0.0.1:5010/jobs -H "Content-Type: application/json" \
-     -d '{"task_type": "send_email", "payload": {"to": "a@b.c", "subject": "hi"}}'
-# => {"job_id": "..."}
-
-# 4. Watch it move through the system
-curl http://127.0.0.1:5010/jobs          # status, attempts, timestamps
-curl http://127.0.0.1:5010/workers       # live workers + current job
-curl http://127.0.0.1:5010/stats
+python -m venv .venv
+# Windows PowerShell: .venv\Scripts\Activate.ps1
+# macOS/Linux: source .venv/bin/activate
+pip install -r requirements-dev.txt
+npm --prefix frontend ci
+python scripts/demo.py
 ```
 
-### Kill a worker mid-job and watch the queue recover it
+Open **http://127.0.0.1:3000**. The launcher starts one broker, three workers, and the dashboard, waits for readiness, and opens your browser. Ctrl+C stops its processes. Jobs survive in `var/demo.db`; logs are in `var/demo-logs/`.
+
+Click **Run demo scenario** to enqueue eight real jobs:
+
+- Six jobs complete normally across email, image, and report tasks.
+- One report fails twice, backs off, and succeeds on its third attempt.
+- One email exhausts a two-attempt budget and enters the dead-letter queue.
+
+Inspect payloads, attempts, timestamps, results, and errors. Filter with the status cards or search. Retrying the demo dead letter resets its budget; its injected fault remains, so it fails again. Submit a clean replacement to demonstrate success after correcting the payload.
+
+Email and image tasks are **simulations**. Reports produce real JSON artifacts. No email is sent.
+
+### Production build locally
 
 ```bash
-# In a terminal, watch statuses
-curl http://127.0.0.1:5010/jobs
-
-# Submit a slow job, then kill the worker running it (Ctrl+C / task manager).
-# The job is requeued instantly (socket EOF) and a live worker completes it.
+npm --prefix frontend run build
+python scripts/demo.py --production --no-open
 ```
 
-### Run the load test
+Use `--workers 5` for a larger fleet. Override occupied ports with `--port 3001 --api-port 5011 --broker-port 5556`. `--no-ui` runs only the broker and workers.
 
-`scripts/load_test.py` spins up a full cluster, pins a worker with a slow job,
-**hard-kills it mid-processing**, floods the system with concurrent submissions,
-and asserts zero job loss:
+Use `--db var/another-demo.db` for a separate cluster's database. Never share one
+database between live brokers. `--duration 30` stops a scripted demo after 30 seconds.
 
-```bash
-python scripts/load_test.py --jobs 100 --workers 3 --slow-jobs 3 --slow-delay 10
-```
+## What to demonstrate
 
-## Delivery guarantees & the exactly-once trap
-
-Two kinds of "at least once" must be distinguished:
-
-| Layer | Guarantee | How |
-|---|---|---|
-| *Completion* | **Exactly once** | `ack` is the only thing that marks a job `succeeded`; a job is dispatched to at most one worker at a time (strict one-job-per-worker protocol) |
-| *Execution* | **At least once** | a crash between claiming and acking leaves the job `running`, so recovery requeues it and another worker runs it again |
-
-Therefore **tasks must be idempotent** — that is the deal Celery/SQS-style
-systems make. The bundled `send_email` task demonstrates idempotency by keying
-writes on a `message_id` payload field so a duplicate execution is harmless.
-This is why the failure-recovery paths below **requeue without incrementing
-`attempts`**: an infrastructure failure is not the task's fault, so it should
-not count against the retry budget.
-
-## Failure recovery
-
-A worker can vanish in three ways, and each has a dedicated recovery path:
-
-1. **Socket EOF (graceful or abrupt close).** A per-connection handler thread
-   sees the disconnect, and if the worker had an in-flight job it is requeued
-   immediately.
-2. **Process kill / network partition (no socket close).** Workers send a
-   heartbeat every `--heartbeat-interval` seconds. The server's monitor thread
-   scans the registry; any `connected` worker that hasn't sent a heartbeat in
-   `--heartbeat-timeout` seconds is declared dead and its in-flight job is
-   requeued.
-3. **Server restart with a crashed worker.** On startup the server calls
-   `recover_unfinished()`: any `running` job whose worker isn't connected is
-   requeued.
-
-Two extra details that make recovery safe:
-
-- **Fresh `worker_id` per session.** After reconnecting, a worker registers with
-  a *new* id. If it re-used the old one, its own heartbeats would keep the
-  broker convinced the (dead) worker holding an orphaned in-flight job is still
-  alive, so the monitor would never requeue it.
-- **Idempotent acks/fails.** `ack`/`fail` are `UPDATE ... WHERE worker_id =
-  current_worker AND status = 'running'`, so a stale or duplicate message from a
-  zombie worker has no effect.
-
-## Retries, backoff, and the dead-letter queue
-
-- A `fail` immediately schedules a retry with delay
-  `min(backoff_cap, backoff_base * 2 ** (attempts - 1))` plus small random
-  jitter, so retries spread instead of thundering-herding.
-- After `max_attempts` (default 5) a job becomes `dead-letter` and is never
-  auto-run again.
-- `POST /dead-letter/<job_id>/retry` resets attempts to 0 and requeues it.
-- `--backoff-base`, `--backoff-cap`, `--max-attempts` are server CLI flags.
-- Note: a worker that *fails* (task raised) sends `fail`, so the server controls
-  the retry delay. A worker that *dies* never sends anything — recovery requeues
-  immediately (path 1/2/3 above), because the failure was infrastructure, not
-  task logic.
-
-## Wire protocol (TCP)
-
-Frames are `4-byte big-endian length + UTF-8 JSON`. Client → server:
-
-| Message | Fields |
+| Capability | Evidence |
 |---|---|
-| `register` | `name`, `capabilities` |
-| `heartbeat` | `worker_id` |
-| `fetch` | `worker_id` |
-| `ack` | `worker_id`, `job_id` |
-| `fail` | `worker_id`, `job_id`, `error` |
-| `unregister` | `worker_id` |
+| Durable state machine | Claimed jobs stay in SQLite until an acknowledgment |
+| Crash recovery | Kill a worker; another reclaims its job |
+| Exponential retry | Scheduled retries with backoff and jitter |
+| Dead-letter operations | Per-job budgets, inspection, manual requeue |
+| Worker isolation | Connection-bound identities; one in-flight job per worker |
+| Capability routing | Workers claim only task types they advertise |
+| Observability | Dashboard, readiness, Prometheus-format metrics |
+| Validated boundaries | Bounded inputs, validated frames, optional bearer auth |
+| Deployment | Non-root images, persistent volumes, health checks, CI |
 
-Server → client: `registered`, `job` (job_id, task_type, payload, priority),
-`no_job`, `ack_ok`, `fail_ok`, `error`. The worker is strictly synchronous
-(`fetch → job → execute → ack/fail → await ack_ok/fail_ok → fetch`), which is
-what makes double-dispatch impossible.
+## Architecture
 
-## REST API
+```text
+ Browser → Next.js dashboard :3000
+                 │ REST proxy /api/*
+                 ▼
+ Flask / Waitress :5010 ── shared Store ── SQLite WAL
+                              ▲
+                         TCP broker :5555
+                              │ framed JSON
+                 ┌────────────┼────────────┐
+                 ▼            ▼            ▼
+              Worker 1     Worker 2     Worker 3
+                 └── fetch → execute → ack/fail ──┘
+```
+
+One broker owns the database connection and worker registry. Its lock serializes claims. Workers run one job at a time and heartbeat on a separate thread. Stale acknowledgments cannot complete jobs owned by another session. Timed-out sessions reconnect with fresh identities.
+
+```text
+queued → running → succeeded
+           ├── task failure → failed → (backoff) → running
+           ├── budget exhausted → dead-letter
+           └── worker loss → queued
+
+dead-letter → (manual retry, attempts reset) → queued
+```
+
+## Guarantees and limits
+
+- **At-least-once execution.** Crashing after a side effect but before ACK can execute a task twice. Idempotency belongs in the integration; there is no exactly-once execution guarantee.
+- **Conditional completion.** Results are accepted only for running jobs owned by the reporting session. Stale reports cannot overwrite completed results.
+- **Recovery.** Socket loss, heartbeat expiry, and broker restart requeue unfinished work. Requeueing does not increment attempts; each subsequent claim does. Infrastructure reclaims contribute to the next failure's budget decision.
+- **Priority.** Higher integers run first, then older jobs. High-priority traffic can starve lower priorities.
+- **Single broker.** Never run multiple brokers against the same SQLite file. No leader election or broker HA. Scale workers, not brokers.
+- **Runtime.** Heartbeats show session liveness, not task progress. Task execution timeouts and forced cancellation are future work.
+- **Retention.** Completed jobs remain until archived/rotated. The executions statistic sums current attempt counters, which reset on manual retries.
+
+The mock email outbox uses a SQLite unique key (message_id, defaulting to job_id) to deduplicate concurrent local deliveries. Workers must share its output volume. This is not an external SMTP guarantee. Reports use validated filenames and atomic replacement.
+
+## API
 
 | Method | Path | Purpose |
 |---|---|---|
-| `POST` | `/jobs` | Submit a job (`task_type`, `payload`, optional `priority`) |
-| `GET` | `/jobs` | List jobs (`?status=`, `?limit=`, `?offset=`) |
-| `GET` | `/jobs/<id>` | Job detail: status, attempts, worker, timestamps, error |
-| `GET` | `/workers` | Live workers: name, capabilities, heartbeat age, current job |
-| `GET` | `/dead-letter` | Dead-lettered jobs |
-| `POST` | `/dead-letter/<id>/retry` | Requeue with attempts reset to 0 |
-| `GET` | `/stats` | Counts by status + total executions |
-| `GET` | `/health` | Liveness probe |
+| POST | `/jobs` | Submit task_type, object payload, optional priority, max_attempts |
+| GET | `/jobs` | Filter status, task_type, search; paginate limit, offset |
+| GET | `/jobs/<id>` | Payload, status, owner, budget, result, timestamps |
+| GET | `/workers` | Capabilities, current job, heartbeat age |
+| GET | `/dead-letter` | Paginated dead letters |
+| POST | `/dead-letter/<id>/retry` | Requeue with attempts reset |
+| GET | `/stats` | State counts and live workers |
+| GET | `/health` | HTTP liveness |
+| GET | `/ready` | Broker/monitor and database readiness |
+| GET | `/metrics` | Prometheus-format job/worker gauges |
 
-The API lives in the server process (waitress, daemon thread), so it reads the
-in-memory worker registry and the shared SQLite store without extra IPC.
+Bodies are limited to 256 KiB. Limit: 1–200; offset: 0–1,000,000; priority: -1000–1000; max_attempts: 1–100. Job responses use job_id and UTC ISO timestamps with Z. Worker timestamps are Unix seconds. Lists include has_more.
 
-## Storage
+Set **DJQ_API_KEY** in the broker environment to protect everything except health/readiness. Clients send an Authorization bearer token. Enter it in dashboard **Connection settings**; it stays in tab memory. **DJQ_API_URL** configures the dashboard upstream at runtime. The dashboard never injects a privileged server token.
 
-SQLite in WAL mode with a single connection guarded by a lock (good enough for a
-single broker, and it makes ordering trivially correct). Naive-UTC timestamps.
-One `jobs` table: `job_id, task_type, payload, priority, status, attempts,
-created_at, scheduled_at, started_at, finished_at, current_worker, error`.
+TCP workers require a trusted private network: no transport encryption or worker authentication. Keep port 5555 private. For remote use, configure HTTPS, a token, and network restrictions. Compose exposes only the dashboard on loopback.
 
-## Tasks
-
-Tasks are plain Python functions registered under a name:
-
-```python
-# worker/tasks/email.py
-@registry.register("send_email")
-def send_email(payload):
-    ...
-```
-
-The registry supports **capability matching** (`--capabilities send_email`
-on a worker restricts it), and a test-only `injectable_failure` wrapper that
-simulates flaky tasks via `payload.fail_first_n` / `payload.fail_probability`.
-Three examples ship: `send_email` (idempotent), `resize_image` (simulated),
-`generate_report`.
-
-## Project layout
-
-```
-common/protocol.py     wire protocol (framing + message constructors)
-server/store.py        SQLite store: statuses, backoff, recovery, stats
-server/queue_server.py TCP broker, worker registry, heartbeat monitor
-server/main.py         python -m server (broker + monitor + REST API)
-api/server.py          Flask app + waitress runner
-worker/worker.py       python -m worker (session loop, heartbeats)
-worker/tasks/          registry + example tasks
-scripts/load_test.py   cluster kill/recover load test
-tests/                 6 pytest modules, 38 tests
-```
-
-## Design trade-offs vs. the big tools
-
-| | This system | Celery/RabbitMQ | SQS | Kafka |
-|---|---|---|---|---|
-| Guarantee | at-least-once; exactly-once *completion* via ack + idempotent tasks | at-least-once | at-least-once (SQS) | at-least-once (Kafka exactly-once possible at high cost) |
-| Broker | in-process TCP broker | RabbitMQ broker | hosted | log-based broker |
-| Visibility/timeout | heartbeat + socket EOF (no explicit lock TTL) | ack + visibility via broker | visibility timeout | consumer group rebalance |
-| Ordering | by priority, not strict FIFO | queue order | best-effort | partition order |
-| Ops | zero external deps | RabbitMQ to run | vendor-managed | ZooKeeper/KRaft to run |
-
-The trade-off in a nutshell: **one simple process, no broker to run, an
-explainable recovery model** — at the cost of HA, ordering, and massive scale.
-The power of the design is that every guarantee is derived from a tiny set of
-primitives: *claim-marks-running, heartbeat-for-liveness, ack-is-truth, and
-idempotent tasks.*
-
-## Tests
+## Docker
 
 ```bash
-python -m pytest tests -q        # 38 tests incl. recovery, protocol, API, retries
+docker compose up --build --wait --scale worker=3
+docker compose logs -f broker worker
+docker compose down
 ```
 
-Highlights: a lodash-style `RawWorker` helper that speaks raw TCP frames
-(garbage, fragmented, empty, oversized) to abuse the framing layer; `wait_for`
-polling; `SpawnedWorker` for real-process tests; parametrized recovery tests
-(EOF, heartbeat timeout, server restart); and flaky-task retry tests.
+Named volumes preserve the queue and shared task outputs. Removing volumes deletes their data. Copy `.env.example` to `.env` for token/port configuration. See [operations](docs/OPERATIONS.md).
+
+## Verification
+
+```bash
+python -m pytest tests -q
+npm --prefix frontend run lint
+npm --prefix frontend test
+npm --prefix frontend run build
+python scripts/load_test.py --jobs 100 --workers 3 --slow-jobs 2 --slow-delay 3
+```
+
+The load test creates an isolated cluster, kills a worker mid-job, submits concurrent work, and verifies every job succeeds and the victim's job was reclaimed. It uses a temporary database and output directory. Attached mode never kills external processes.
+
+GitHub Actions runs backend tests, recovery load testing, frontend checks, and Docker Compose health checks. See [the interview walkthrough](docs/DEMO.md) and [verification notes](docs/VERIFICATION.md).
+
+## Repository map
+
+```text
+api/server.py           REST, validation, auth, probes, metrics
+common/protocol.py      Length-prefixed JSON frames
+server/store.py         Durable state machine and retry scheduling
+server/queue_server.py  Connection ownership, dispatch, recovery
+worker/worker.py        Reconnecting sessions and execution
+worker/tasks/           Registry, mock outbox, image simulation, reports
+frontend/              Next.js dashboard and API proxy
+scripts/demo.py        Local process supervisor
+scripts/load_test.py   Crash/recovery acceptance test
+compose.yaml           Single-host deployment with scalable workers
+```
